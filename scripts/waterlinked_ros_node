@@ -1,0 +1,114 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import requests
+import argparse
+import json
+import rospy
+import time
+from sensor_msgs.msg import NavSatFix
+from geometry_msgs.msg import PointStamped
+
+
+def get_data(url: str):
+    try:
+        r = requests.get(url)
+        stamp = rospy.Time.now()
+    except requests.exceptions.RequestException as exc:
+        rospy.logerr('Exception occured {}'.format(exc))
+        return None
+    if r.status_code != requests.codes.ok:
+        rospy.logerr('Got error {}: {}'.format(r.status_code, r.text))
+        return None
+    data = r.json()
+    data.update({"stamp": stamp})
+    return data
+
+
+def get_point_msg(data: dict) -> PointStamped:
+    point = PointStamped()
+    point.header.stamp = data["stamp"]
+    point.point.x = data['x']
+    point.point.y = data['y']
+    point.point.z = data['z']
+    return point
+
+
+def main():
+    rospy.init_node('waterlinked')
+    address = rospy.get_param("~address", "192.168.2.94")
+    map_frame_id = rospy.get_param("~map_frame_id", "map")
+    beacon_frame_id = rospy.get_param("~map_frame_id", "base_link")
+
+    base_url = f"http://{address}"
+
+    raw_pub = rospy.Publisher('acoustic_position/raw',
+                              PointStamped, queue_size=120)
+    filtered_pub = \
+        rospy.Publisher('acoustic_position/filtered',
+                        PointStamped, queue_size=120)
+    global_pub = rospy.Publisher('fix',
+                                  NavSatFix, queue_size=120)
+
+    rate = rospy.Rate(10)
+    last_raw, last_filtered = None, None
+    while not rospy.is_shutdown():
+
+        pub_fix_flag = False
+
+        data_raw = get_data(f'{base_url}/api/v1/position/acoustic/raw')
+        if data_raw is not None:
+            point = get_point_msg(data_raw)
+            point.header.frame_id = map_frame_id
+
+            if last_raw is None:
+                raw_pub.publish(point)
+                last_raw = point
+                pub_fix_flag = True
+            else:
+                dist = (point.point.x - last_raw.point.x) ** 2 +\
+                        (point.point.y - last_raw.point.y) ** 2 +\
+                        (point.point.z - last_raw.point.z) ** 2
+                if dist > 1e-10:
+                    raw_pub.publish(point)
+                    pub_fix_flag = True
+                last_raw = point
+        
+
+        # FilRawtered position message
+        data_filtered = get_data(f'{base_url}/api/v1/position/acoustic/filtered')
+
+        if data_filtered is not None:
+            point = get_point_msg(data_filtered)
+            point.header.frame_id = map_frame_id
+
+            if last_filtered is None:
+                raw_pub.publish(point)
+                last_filtered = point
+                pub_fix_flag = True
+            else:
+                dist = (point.point.x - last_filtered.point.x) ** 2 +\
+                        (point.point.y - last_filtered.point.y) ** 2 +\
+                        (point.point.z - last_filtered.point.z) ** 2
+                if dist > 1e-10:
+                    raw_pub.publish(point)
+                    pub_fix_flag = True
+                last_filtered = point
+
+        # NavSatFix message
+        data = get_data(f'{base_url}/api/v1/position/global')
+        if pub_fix_flag:
+            global_point = NavSatFix()
+            global_point.header.stamp = rospy.Time.now()
+            global_point.header.frame_id = beacon_frame_id
+            global_point.latitude = data['lat']
+            global_point.longitude = data['lon']
+            global_pub.publish(global_point)
+        rate.sleep()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
